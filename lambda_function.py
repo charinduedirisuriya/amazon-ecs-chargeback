@@ -1,28 +1,64 @@
 import json
+import sys
 import boto3
 from boto3.session import Session
 import datetime
+import mysql.connector
+from mysql.connector import errorcode
 
-# Copyright 2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 (the "License").
-# You may not use this file except in compliance with the License.
-# A copy of the License is located at
-#
-#     http://aws.amazon.com/apache2.0/
-#
-# or in the "license" file accompanying this file.
-# This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and limitations under the License.
+
+
+def getConnection():
+  try:
+    cnx = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    passwd="password",database='ecs_task_tracker'
+    )
+    return cnx
+  except mysql.connector.Error as err:
+    if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
+      print("Something is wrong with your user name or password")
+    elif err.errno == errorcode.ER_BAD_DB_ERROR:
+      print("Database does not exist")
+    else:
+      print(err)
+    return None
+
+
+def save_data(taskDefinition,db):
+    mycursor = db.cursor()
+    sql = "INSERT INTO task_definitions VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    val = (taskDefinition['taskArn'], taskDefinition['clusterArn'], taskDefinition['containerInstanceArn'], taskDefinition['cpu'], taskDefinition['group'], taskDefinition['groupName'], taskDefinition['instanceId'], taskDefinition['instanceType'], taskDefinition['launchType'], taskDefinition['memory'], taskDefinition['osType'], taskDefinition['region'], taskDefinition['runTime'], taskDefinition['startedAt'],  taskDefinition['stoppedAt'])
+    mycursor.execute(sql, val)
+    db.commit()
+
+
+def update_task_runtime(taskArn, stoppedAt, runTime, db):
+    print("updating record")
+    mycursor = db.cursor()
+    sql = "UPDATE task_definitions set stoppedAt = '"+str(stoppedAt)+"', runTime =  '"+str(runTime)+"' WHERE taskArn = '"+str(taskArn)+"'"
+    mycursor.execute(sql)
+    db.commit()
+
+def getTask(taskArn, db):
+    data = {}
+    sql  = "SELECT * FROM task_definitions WHERE taskArn = '"+taskArn+"'"
+    mycursor = db.cursor()
+    mycursor.execute(sql)
+    myresult = mycursor.fetchall()
+    print(myresult)
+    return myresult
 
 
 def lambda_handler(event, context):
-    id_name = "taskArn"
-
-    new_record = {}
-    # For debugging so you can see raw event format.
     print('Here is the event:')
     print(json.dumps(event))
-
+    id_name = "taskArn"
+    database = getConnection()
+    new_record = {}
+    # For debugging so you can see raw event format.
+   
     if event["source"] != "aws.ecs" and event["detail-type"] != "ECS Task State Change":
         raise ValueError("Function only supports input from events with a source type of: aws.ecs and of type - ECS Task State Change -")
 
@@ -31,9 +67,7 @@ def lambda_handler(event, context):
 
         s = Session()
         cur_region = s.region_name
-        dynamodb = boto3.resource("dynamodb", region_name=cur_region)
-        table = dynamodb.Table("ECSTaskStatus")
-        saved_event = table.get_item( Key = { id_name : event_id } )
+        saved_event = getTask(event_id, database)
         
         # Look first to see if you have received this taskArn before.
         # If not,
@@ -43,21 +77,9 @@ def lambda_handler(event, context):
         # If yes,
         #   - that just means that you are receiving a task change - mostly a stop event.
         #   - store the stop time in the task item in DDB
-        if "Item" in saved_event:
+        if len(saved_event) > 0:
             if event["detail"]["lastStatus"] == "STOPPED":
-                #table.update_item( Key= { id_name : event_id },
-                #   AttributeUpdates= {
-                #       'stoppedAt': {'S':  event["detail"]["stoppedAt"]},
-                #   },
-                #)
-                table.update_item( Key= { id_name : event_id },
-                    UpdateExpression="set stoppedAt = :d, runTime=:t",
-                    ExpressionAttributeValues={
-                        ':d': str(event["detail"]["stoppedAt"]),
-                        ':t': getRunTime(event["detail"]["startedAt"], event["detail"]["stoppedAt"])
-                    },
-                    ReturnValues="UPDATED_NEW"
-                )
+                update_task_runtime(event_id, str(event["detail"]["stoppedAt"]), getRunTime(event["detail"]["startedAt"], event["detail"]["stoppedAt"]), database)
                 print("Saving updated event - ID " + event_id)
         else:
             # This could be if the task has just started, or
@@ -90,9 +112,10 @@ def lambda_handler(event, context):
                 new_record['stoppedAt']     = event["detail"]["stoppedAt"]
                 new_record['runTime']       = getRunTime(event["detail"]["startedAt"], event["detail"]["stoppedAt"])
                         
-            table.put_item( Item=new_record )
+            save_data(new_record, database)
             print("Saving new event - ID " + event_id)
-            
+
+
 def getInstanceType(region, cluster, instance, launchType):
     instanceType    = 'INSTANCE_TYPE_UNKNOWN'
     osType          = 'linux'
@@ -133,4 +156,3 @@ def getRunTime(startTime, stopTime):
     stop = datetime.datetime.strptime(stopTime, '%Y-%m-%dT%H:%M:%S.%fZ')
     runTime = (stop-start).total_seconds()
     return int(round((runTime)))
-

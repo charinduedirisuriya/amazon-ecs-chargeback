@@ -15,19 +15,55 @@ import boto3
 from boto3.session import Session
 from argparse import ArgumentParser
 import logging
+import mysql.connector
+from mysql.connector import errorcode
 import datetime
 from dateutil.tz import *
 
 container_instance_ec2_mapping = {}
 
-def putTasks(region, cluster, task):
+
+def getConnection():
+  try:
+    cnx = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    passwd="password",database='ecs_task_tracker'
+    )
+    return cnx
+  except mysql.connector.Error as err:
+    if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
+      print("Something is wrong with your user name or password")
+    elif err.errno == errorcode.ER_BAD_DB_ERROR:
+      print("Database does not exist")
+    else:
+      print(err)
+    return None
+
+
+def save_data(taskDefinition,db):
+    mycursor = db.cursor()
+    sql = "INSERT INTO task_definitions VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    val = (taskDefinition['taskArn'], taskDefinition['clusterArn'], taskDefinition['containerInstanceArn'], taskDefinition['cpu'], taskDefinition['group'], taskDefinition['groupName'], taskDefinition['instanceId'], taskDefinition['instanceType'], taskDefinition['launchType'], taskDefinition['memory'], taskDefinition['osType'], taskDefinition['region'], taskDefinition['runTime'], taskDefinition['startedAt'],  taskDefinition['stoppedAt'])
+    mycursor.execute(sql, val)
+    db.commit()
+
+def getTask(taskArn, db):
+    data = {}
+    sql  = "SELECT * FROM task_definitions WHERE taskArn = '"+taskArn+"'"
+    mycursor = db.cursor()
+    mycursor.execute(sql)
+    myresult = mycursor.fetchall()
+    print(myresult)
+    return myresult
+
+
+def putTasks(region, cluster, task, database):
     id_name = 'taskArn'
     task_id = task["taskArn"]
     new_record = {}
-
-    dynamodb = boto3.resource("dynamodb", region_name=region)
-    table = dynamodb.Table("ECSTaskStatus")
-    saved_task = table.get_item( Key = { id_name : task_id } )
+    
+    saved_task = getTask(task_id,database)
         
     # Look first to see if you have received this taskArn before.
     # If not,
@@ -36,7 +72,7 @@ def putTasks(region, cluster, task):
     # If yes,
     #   - the script is being run after the solution has been deployed.
     #   - dont do anything. quit.
-    if "Item" in saved_task:
+    if len(saved_task) > 0:
             print("Task: %s already in the DynamoDB table." % (task_id) )
             return 1
     else:
@@ -63,8 +99,9 @@ def putTasks(region, cluster, task):
         new_record["taskArn"]       = task_id
         new_record['stoppedAt'] = 'STILL-RUNNING'
         new_record['runTime'] = 0
-
-        table.put_item( Item=new_record )
+        
+        save_data(new_record, database)
+        #table.put_item( Item=new_record )
         return 0
             
 def getInstanceType(region, cluster, instance, launchType):
@@ -114,6 +151,8 @@ if __name__ == "__main__":
     cli_args = parser.parse_args()
     region = cli_args.region
 
+    database = getConnection()
+
     if cli_args.verbose:
         logging.basicConfig(level=logging.DEBUG)
 
@@ -142,4 +181,4 @@ if __name__ == "__main__":
         taskDetails = ecs.describe_tasks(cluster=cluster, tasks=[task])
 
         # Get all tasks in the cluster and make an entry in DDB.
-        tasks = putTasks(region, cluster, taskDetails['tasks'][0])
+        tasks = putTasks(region, cluster, taskDetails['tasks'][0], database)
